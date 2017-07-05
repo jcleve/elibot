@@ -23,15 +23,6 @@ long previousMillis = 0;                                // will store last time 
 long sendInterval = SLOW;                               // interval between Buttons status transmission (milliseconds)
 String displayStatus = "xxxx";                          // message to Android device
 
-#define DIRECTION_STOP 0
-#define DIRECTION_FORWARD 1
-#define DIRECTION_REVERSE 2
-#define DIRECTION_ROTATE_RIGHT 3
-#define DIRECTION_ROTATE_LEFT 4
-#define IDLE_MAX 20
-
-int vehicleDirection = DIRECTION_STOP;
-
 void setup() {
   Serial.begin(57600);
   Serial1.begin(57600);           // set up Serial library at 9600 bps
@@ -86,6 +77,38 @@ void loop() {
   uint8_t i;
 }
 
+// Differential Steering Joystick Algorithm
+// ========================================
+//   by Calvin Hass
+//   http://www.impulseadventure.com/elec/
+//
+// Converts a single dual-axis joystick into a differential
+// drive motor control, with support for both drive, turn
+// and pivot operations.
+//
+
+// INPUTS
+int     nJoyX;              // Joystick X input                     (-128..+127)
+int     nJoyY;              // Joystick Y input                     (-128..+127)
+
+// OUTPUTS
+int     nMotMixL;           // Motor (left)  mixed output           (-128..+127)
+int     nMotMixR;           // Motor (right) mixed output           (-128..+127)
+
+// CONFIG
+// - fPivYLimt  : The threshold at which the pivot action starts
+//                This threshold is measured in units on the Y-axis
+//                away from the X-axis (Y=0). A greater value will assign
+//                more of the joystick's range to pivot actions.
+//                Allowable range: (0..+127)
+
+// TEMP VARIABLES
+float   nMotPremixL;    // Motor (left)  premixed output        (-128..+127)
+float   nMotPremixR;    // Motor (right) premixed output        (-128..+127)
+int     nPivSpeed;      // Pivot Speed                          (-128..+127)
+float   fPivScale;      // Balance scale b/w drive and pivot    (   0..1   )
+float fPivYLimit = 50.0;
+
 void getJoystickState(byte data[8])
 {
   Serial.println("getJoystickState");
@@ -94,93 +117,99 @@ void getJoystickState(byte data[8])
   joyX = joyX - 200;                                                  // Offset to avoid
   joyY = joyY - 200;                                                  // transmitting negative numbers
 
-  if (joyX < -100 || joyX > 100 || joyY < -100 || joyY > 100)     return; // commmunication error
+  Serial.print("joyY: ");
+  Serial.println(joyY);
 
-  bool pivot = false;
-  int speedY = 0;
-  if (joyY > 0) // move forward
-  {
-    speedY = map(joyY, 0, 100, 0, 255);
-    vehicleDirection = DIRECTION_FORWARD;
+  Serial.print("joyX: ");
+  Serial.println(joyX);
+
+  nJoyX = map(joyX, -100, 100, -128, 127);
+  nJoyY = map(joyY, -100, 100, -128, 127);
+
+  // Calculate Drive Turn output due to Joystick X input
+  if (nJoyY >= 0) {
+    // Forward
+    nMotPremixL = (nJoyX >= 0) ? 127.0 : (127.0 + nJoyX);
+    nMotPremixR = (nJoyX >= 0) ? (127.0 - nJoyX) : 127.0;
+  } else {
+    // Reverse
+    nMotPremixL = (nJoyX >= 0) ? (127.0 - nJoyX) : 127.0;
+    nMotPremixR = (nJoyX >= 0) ? 127.0 : (127.0 + nJoyX);
   }
-  else if (joyY < 0) //move backward
-  {
-    speedY = map(joyY, -100, 0, 255, 0);
-    vehicleDirection = DIRECTION_REVERSE;
-  }
 
-  int speedX_R = (map(joyX, -100, 100, speedY, 0));
-  int speedX_L = (map(joyX, -100, 100, 0, speedY));
+  // Scale Drive output due to Joystick Y input (throttle)
+  nMotPremixL = nMotPremixL * nJoyY / 128.0;
+  nMotPremixR = nMotPremixR * nJoyY / 128.0;
 
-//  Serial.print("joyY: ");
-//  Serial.println(joyY);
-//
-//  Serial.print("joyX: ");
-//  Serial.println(joyX);
-//
-//  Serial.print("speedY: ");
-//  Serial.println(speedY);
-//
-//  Serial.print("speedX_R: ");
-//  Serial.println(speedX_R);
-//
-//  Serial.print("speedX_L: ");
-//  Serial.println(speedX_L);
+  // Now calculate pivot amount
+  // - Strength of pivot (nPivSpeed) based on Joystick X input
+  // - Blending of pivot vs drive (fPivScale) based on Joystick Y input
+  nPivSpeed = nJoyX;
+  fPivScale = (abs(nJoyY) > fPivYLimit) ? 0.0 : (1.0 - abs(nJoyY) / fPivYLimit);
 
-  if (joyY == 0 && joyX == 0)     // no controller input so stop motors
-  {
-    myMotor1->run(RELEASE);
-    myMotor2->run(RELEASE);
-    myMotor3->run(RELEASE);
-    myMotor4->run(RELEASE);
-  }
-  else if (abs(joyY) < 20 && abs(joyX) > 20) // pivot
-  {
-    pivot = true;
-    int pivotSpeed = 0;
-    pivotSpeed = map(abs(joyX), 0, 100, 0, 255);
-    if (joyX > 0) // pivot right
-    {      
-      myMotor1->run(FORWARD);
-      myMotor2->run(FORWARD);
-      myMotor3->run(FORWARD);
-      myMotor4->run(FORWARD);
-    }
-    else
-    {
-      myMotor1->run(BACKWARD);
-      myMotor2->run(BACKWARD);
-      myMotor3->run(BACKWARD);
-      myMotor4->run(BACKWARD);
-    }
+  Serial.print("fPivScale: ");
+  Serial.println(fPivScale);
 
-    myMotor1->setSpeed(pivotSpeed);
-    myMotor2->setSpeed(pivotSpeed);
-    myMotor3->setSpeed(pivotSpeed);
-    myMotor4->setSpeed(pivotSpeed);
+  // Calculate final mix of Drive and Pivot
+  nMotMixL = (1.0 - fPivScale) * nMotPremixL + fPivScale * ( nPivSpeed);
+  nMotMixR = (1.0 - fPivScale) * nMotPremixR + fPivScale * (-nPivSpeed);
 
-  }
-  else if (joyY > 0) // go forward
+  //nMotMixL = map(abs(nMotMixL), 0, 127, 0, 255);
+  //nMotMixR = map(abs(nMotMixR), 0, 127, 0, 255);
+  
+  Serial.print("nMotMixL: ");
+  Serial.println(nMotMixL);
+
+  Serial.print("nMotMixR: ");
+  Serial.println(nMotMixR);
+
+  int speedL = map(abs(nMotMixL), 0, 127, 0, 255);
+  int speedR = map(abs(nMotMixR), 0, 127, 0, 255);
+
+  if(nMotMixL > 0) //forward
   {
     myMotor1->run(FORWARD);
-    myMotor2->run(BACKWARD);
-    myMotor3->run(BACKWARD);
-    myMotor4->run(FORWARD);
+    myMotor4->run(FORWARD);   
   }
-  else if (joyY < 0) // go backward
+  else if(nMotMixL < 0) //reverse
   {
     myMotor1->run(BACKWARD);
-    myMotor2->run(FORWARD);
-    myMotor3->run(FORWARD);
     myMotor4->run(BACKWARD);
   }
-
-  if (!pivot)
+  else
   {
-    myMotor1->setSpeed(speedX_L);
-    myMotor2->setSpeed(speedX_R);
-    myMotor3->setSpeed(speedX_R);
-    myMotor4->setSpeed(speedX_L);
+    myMotor1->run(RELEASE);
+    myMotor4->run(RELEASE);
   }
+
+  if(nMotMixR > 0) // forward
+  {
+    myMotor2->run(BACKWARD);
+    myMotor3->run(BACKWARD);
+  }
+  else if(nMotMixR < 0) //reverse
+  {
+    myMotor2->run(FORWARD);
+    myMotor3->run(FORWARD);
+  }
+  else
+  {
+    myMotor2->run(RELEASE);
+    myMotor3->run(RELEASE);
+  }
+
+  myMotor1->setSpeed(speedL);
+  myMotor2->setSpeed(speedR);
+  myMotor3->setSpeed(speedR);
+  myMotor4->setSpeed(speedL);
+
 }
+
+
+
+
+
+
+
+
 
